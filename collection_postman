@@ -1,0 +1,91 @@
+{
+	"info": {
+		"_postman_id": "16ac4398-027c-4026-89e3-3e8fe8e0ed18",
+		"name": "ArcFace Meetaza",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json",
+		"_exporter_id": "30815068"
+	},
+	"item": [
+		{
+			"name": "Compare Insight",
+			"request": {
+				"method": "POST",
+				"header": [],
+				"body": {
+					"mode": "raw",
+					"raw": "{\r\n  \"profile_image\": \"{{prof_images}}\",\r\n  \"current_image\": \"{{curr_images}}\",\r\n  \"threshold\": 0.61\r\n}",
+					"options": {
+						"raw": {
+							"language": "json"
+						}
+					}
+				},
+				"url": {
+					"raw": "{{url}}/compare",
+					"host": [
+						"{{url}}"
+					],
+					"path": [
+						"compare"
+					]
+				}
+			},
+			"response": []
+		},
+		{
+			"name": "Health",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{url}}/health",
+					"host": [
+						"{{url}}"
+					],
+					"path": [
+						"health"
+					]
+				}
+			},
+			"response": []
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"requests": {},
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"packages": {},
+				"requests": {},
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "prof_images",
+			"value": ""
+		},
+		{
+			"key": "curr_images",
+			"value": ""
+		},
+		{
+			"key": "url",
+			"value": ""
+		}
+	]
+}
