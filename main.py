@@ -1,22 +1,22 @@
 # main.py
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from typing import Optional
 from fastapi.middleware.cors import CORSMiddleware
+
 import io
+import os
+import base64
+
 from PIL import Image
 import numpy as np
 import cv2
 import insightface
-import pickle
-import os
-from sklearn.svm import SVC
 
-app = FastAPI(
-    title="Face Recognition API",
-    description="API pengenalan wajah pakai InsightFace (buffalo_s) + SVM (form-data)",
-    version="1.1.0",
-)
+app = FastAPI()
 
-# ====== CORS ======
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,96 +25,216 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    errors = []
+    for error in exc.errors():
+        error_msg = error.get("msg", "")
+        error_loc = " -> ".join(str(loc) for loc in error.get("loc", []))
+        errors.append(f"{error_loc}: {error_msg}")
+
+    return JSONResponse(
+        status_code=422,
+        content={
+            "status": "error",
+            "message": "Validation error",
+            "errors": errors,
+        },
+    )
+
+class FaceCompareRequest(BaseModel):
+    reference_image: str  # base64
+    target_image: str     # base64
+    threshold: Optional[float] = None  # kalau mau override threshold
+
+class RegisterFaceRequest(BaseModel):
+    name: str
+    image_base64: str
+
+class RecognizeRequest(BaseModel):
+    image_base64: str
+    threshold: Optional[float] = None
+
+
+def decode_base64_to_image(base64_string: str) -> Image.Image:
+    try:
+        if "," in base64_string:
+            base64_string = base64_string.split(",", 1)[1]
+        image_data = base64.b64decode(base64_string)
+        image = Image.open(io.BytesIO(image_data)).convert("RGB")
+        return image
+    except Exception as e:
+        raise ValueError(f"Invalid base64 image: {str(e)}")
+
+
+DATASET_DIR = "dataset_dynamic"
+os.makedirs(DATASET_DIR, exist_ok=True)
+
+print("Loading InsightFace model ...")
 face_app = insightface.app.FaceAnalysis(name="buffalo_s")
-# ctx_id = 0 → GPU | -1 → CPU
+# ctx_id = 0 -> GPU, -1 -> CPU
 face_app.prepare(ctx_id=0, det_size=(640, 640))
+print("InsightFace loaded ✅")
 
-SVM_PATH = "svm_face.pkl"
-if not os.path.exists(SVM_PATH):
-    raise FileNotFoundError("❌ svm_face.pkl tidak ditemukan. Jalankan /train-svm atau siapkan model terlebih dulu.")
 
-with open(SVM_PATH, "rb") as f:
-    svm_model = pickle.load(f)
+def preload_test_images():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    dummy1 = os.path.join(current_dir, "dataset_static/billie/dummy1.jpg")
+    dummy2 = os.path.join(current_dir, "dataset_static/madison/dummy2.jpg")
 
+    if os.path.exists(dummy1) and os.path.exists(dummy2):
+        print("Found dummy images, testing InsightFace...")
+        img1 = cv2.cvtColor(np.array(Image.open(dummy1).convert("RGB")), cv2.COLOR_RGB2BGR)
+        img2 = cv2.cvtColor(np.array(Image.open(dummy2).convert("RGB")), cv2.COLOR_RGB2BGR)
+        faces1 = face_app.get(img1)
+        faces2 = face_app.get(img2)
+        if faces1 and faces2:
+            emb1 = faces1[0].normed_embedding
+            emb2 = faces2[0].normed_embedding
+            sim = float(np.dot(emb1, emb2))
+            print(f"Preload test similarity: {sim:.4f}")
+        else:
+            print("Dummy images do not contain detectable faces.")
+    else:
+        print("No dummy images found, skipping preload test.")
+
+
+preload_test_images()
+
+
+def load_all_embeddings():
+    db = []
+    for file in os.listdir(DATASET_DIR):
+        if file.endswith(".npy"):
+            path = os.path.join(DATASET_DIR, file)
+            emb = np.load(path)
+            label = os.path.splitext(file)[0]
+            db.append((label, emb))
+    return db
 
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
 
-
-@app.post("/recognize")
-async def recognize(file: UploadFile = File(...)):
+@app.post("/register-face")
+async def register_face_json(body: RegisterFaceRequest):
     try:
-        contents = await file.read()
-        img = Image.open(io.BytesIO(contents)).convert("RGB")
-        img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-        faces = face_app.get(img)
-        if len(faces) == 0:
-            return {"status": "error", "message": "no face detected"}
-
-        emb = faces[0].normed_embedding
-
-        pred_label = svm_model.predict([emb])[0]
-        prob = float(max(svm_model.predict_proba([emb])[0]))
-
+        pil_img = decode_base64_to_image(body.image_base64)
+    except Exception as e:
         return {
-            "status": "success",
-            "person": pred_label,
-            "confidence": round(prob, 4),
+            "status": "error",
+            "message": "Invalid image_base64",
+            "errors": str(e),
         }
 
-    except Exception as e:
-        return {"status": "error", "message": f"Processing failed: {str(e)}"}
-
-
-@app.post("/register-face")
-async def register_face(name: str = Form(...), file: UploadFile = File(...)):
-    contents = await file.read()
-    img = Image.open(io.BytesIO(contents)).convert("RGB")
-    img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-
-    faces = face_app.get(img)
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    faces = face_app.get(img_bgr)
     if len(faces) == 0:
         return {"status": "error", "message": "no face detected"}
 
-    emb = faces[0].normed_embedding
+    emb = faces[0].normed_embedding  # vector 512 dim normalized
 
-    os.makedirs("dataset_dynamic", exist_ok=True)
-    with open(f"dataset_dynamic/{name}.npy", "wb") as f:
-        np.save(f, emb)
+    save_path = os.path.join(DATASET_DIR, f"{body.name}.npy")
+    np.save(save_path, emb)
 
-    return {"status": "success", "message": f"face of {name} registered"}
+    return {
+        "status": "success",
+        "message": f"face of {body.name} registered",
+    }
 
+@app.post("/compare-insight")
+async def compare_insight(body: FaceCompareRequest):
+    # --- decode reference ---
+    try:
+        ref_pil = decode_base64_to_image(body.reference_image)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Invalid reference image",
+            "errors": str(e),
+        }
 
-@app.post("/train-svm")
-def train_svm():
-    dataset_dir = "dataset_dynamic"
-    if not os.path.exists(dataset_dir):
-        return {"status": "error", "message": "dataset_dynamic folder not found"}
+    # --- decode target ---
+    try:
+        tgt_pil = decode_base64_to_image(body.target_image)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Invalid target image",
+            "errors": str(e),
+        }
 
-    X, y = [], []
-    for file in os.listdir(dataset_dir):
-        if file.endswith(".npy"):
-            path = os.path.join(dataset_dir, file)
-            emb = np.load(path)
-            label = os.path.splitext(file)[0]
-            X.append(emb)
-            y.append(label)
+    ref_bgr = cv2.cvtColor(np.array(ref_pil), cv2.COLOR_RGB2BGR)
+    tgt_bgr = cv2.cvtColor(np.array(tgt_pil), cv2.COLOR_RGB2BGR)
 
-    if len(X) < 2:
-        return {"status": "error", "message": "Need at least 2 faces to train SVM"}
+    ref_faces = face_app.get(ref_bgr)
+    tgt_faces = face_app.get(tgt_bgr)
 
-    X = np.array(X)
-    y = np.array(y)
+    if len(ref_faces) == 0 or len(tgt_faces) == 0:
+        return {
+            "status": "error",
+            "message": "face not detected on one/both images",
+        }
 
-    model = SVC(kernel="linear", probability=True)
-    model.fit(X, y)
+    ref_emb = ref_faces[0].normed_embedding
+    tgt_emb = tgt_faces[0].normed_embedding
 
-    with open("svm_face.pkl", "wb") as f:
-        pickle.dump(model, f)
+    similarity = float(np.dot(ref_emb, tgt_emb))
+    threshold = body.threshold if body.threshold is not None else 0.35
+    is_match = similarity >= threshold
 
-    global svm_model
-    svm_model = model
+    return {
+        "status": "success",
+        "message": "Face comparison successful",
+        "data": {
+            "match": is_match,
+            "similarity": round(similarity, 4),
+            "threshold_used": threshold,
+        },
+    }
+ 
+@app.post("/recognize-face")
+async def recognize_face(body: RecognizeRequest):
+    try:
+        pil_img = decode_base64_to_image(body.image_base64)
+    except Exception as e:
+        return {
+            "status": "error",
+            "message": "Invalid image_base64",
+            "errors": str(e),
+        }
 
-    return {"status": "success", "message": f"SVM trained with {len(y)} faces"}
+    img_bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    faces = face_app.get(img_bgr)
+    if len(faces) == 0:
+        return {"status": "error", "message": "no face detected"}
+
+    probe_emb = faces[0].normed_embedding
+
+    db = load_all_embeddings()
+    if len(db) == 0:
+        return {"status": "error", "message": "no registered faces in database"}
+
+    best_label = None
+    best_score = -1.0
+
+    for label, emb in db:
+        score = float(np.dot(probe_emb, emb))
+        if score > best_score:
+            best_score = score
+            best_label = label
+
+    threshold = body.threshold if body.threshold is not None else 0.35
+    is_match = best_score >= threshold
+
+    return {
+        "status": "success",
+        "message": "Face recognition finished",
+        "data": {
+            "predicted_label": best_label if is_match else "unknown",
+            "similarity": round(best_score, 4),
+            "threshold_used": threshold,
+            "matched": is_match,
+        },
+    }
